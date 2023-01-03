@@ -1,5 +1,7 @@
 import asyncio
 
+import httpx
+
 
 async def maybe_coro(coro, *args, **kwargs):
     loop = asyncio.get_running_loop()
@@ -43,45 +45,67 @@ class MultiConnectionDownloader:
     ):
 
         headers = self.kwargs.pop("headers", {})
-
-        if end is None:
-            if start is not None:
-                headers["Range"] = f"bytes={start}-"
-        else:
-            headers["Range"] = f"bytes={start}-{end}"
-
+        content_length = end
         position = start or 0
 
-        async with self.session.stream(
-            *self.args, **self.kwargs, headers=headers
-        ) as response:
-            if progress_bar is not None:
+        is_incomplete = lambda: content_length is None or position < content_length
+        is_downloading = lambda: (pause_event is None or not pause_event.is_set())
 
-                content_length = int(response.headers.get("Content-Length", 0))
+        while is_downloading() and is_incomplete():
 
-                if content_length > 0:
-                    progress_bar.total = content_length
+            if content_length is None:
+                if start is not None:
+                    headers["Range"] = f"bytes={position}-"
+            else:
+                headers["Range"] = f"bytes={position}-{content_length}"
 
-            async for chunk in response.aiter_bytes(8192):
+            try:
+                async with self.session.stream(
+                    *self.args, **self.kwargs, headers=headers
+                ) as response:
 
-                chunk_size = len(chunk)
+                    content_length = (
+                        int(response.headers.get("Content-Length", 0)) or None
+                    )
 
-                if self.progress_bar is not None:
-                    self.progress_bar.update(chunk_size)
+                    if progress_bar is not None:
+
+                        if content_length > 0:
+                            progress_bar.total = content_length
+
+                    async for chunk in response.aiter_bytes(8192):
+
+                        chunk_size = len(chunk)
+
+                        if self.progress_bar is not None:
+                            self.progress_bar.update(chunk_size)
+
+                        if progress_bar is not None:
+                            progress_bar.update(chunk_size)
+
+                        await self.write_to_file(
+                            self.io_lock,
+                            io,
+                            position,
+                            chunk,
+                        )
+                        position += chunk_size
+
+                        if not is_downloading():
+                            break
+
+                    if content_length is None:
+                        content_length = position
+
+            except httpx.HTTPError as e:
+                locks = ()
 
                 if progress_bar is not None:
-                    progress_bar.update(chunk_size)
+                    locks += (progress_bar.get_lock(),)
+                if self.progress_bar is not None:
+                    locks += (self.progress_bar.get_lock(),)
 
-                await self.write_to_file(
-                    self.io_lock,
-                    io,
-                    position,
-                    chunk,
-                )
-                position += chunk_size
-
-                if pause_event is not None and pause_event.is_set():
-                    break
+                # TODO: Warn user about the error.
 
         if future is not None:
             future.set_result((start, position))
@@ -142,4 +166,82 @@ class MultiConnectionDownloader:
         headers["Range"] = "bytes=0-0"
 
         async with session.stream(method, *args, **kwargs) as response:
-            return response.status_code == 206
+            return {
+                "status_code": response.status_code,
+                "headers": response.headers,
+                "url": response.url,
+            }
+
+
+if __name__ == "__main__":
+    from hashlib import md5
+    from io import BytesIO
+
+    from tqdm import tqdm
+
+    TEST_CONNECTIONS = 16
+
+    # Test URLs from various servers [Spotify, Cloudflare, Wikipedia, Github]
+    TEST_URL_HASH = {
+        "https://download.scdn.co/SpotifySetup.exe": "d61d294e1af064d864dfd67e1ead5848",
+        # "https://1111-releases.cloudflareclient.com/windows/Cloudflare_WARP_Release-x64.msi": "f75d5aa24a40cab7a55d7195cbf78d92",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/1/15/Mount_Massive.jpg/1200px-Mount_Massive.jpg": "981b22a05f25f891863b2d2f0994edf5",
+        "https://github.com/rainmeter/rainmeter/releases/download/v4.5.17.3700/Rainmeter-4.5.17.exe": "c1e342df4db7253251c9ee90f0e2f7bc",
+    }
+
+    async def __main__():
+
+        session = httpx.AsyncClient(
+            timeout=None,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.159 Safari/537.36"
+            },
+        )
+
+        for url, md5_hash in TEST_URL_HASH.items():
+
+            progress_bar = tqdm(
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+            )
+
+            response_dict = await MultiConnectionDownloader.is_resumable(
+                session, "GET", url
+            )
+
+            content_length = (
+                int(response_dict["headers"].get("Content-Length", 0)) or None
+            )
+            filename = response_dict["url"].path.split("/")[-1]
+
+            io_object = BytesIO()
+
+            progress_bar.total = content_length
+            progress_bar.set_description(f"<= {filename!r}")
+
+            downloader = MultiConnectionDownloader(
+                session,
+                "GET",
+                url,
+                progress_bar=progress_bar,
+            )
+
+            downloaded_positions = await downloader.allocate_downloads(
+                io_object,
+                content_length if response_dict["status_code"] == 206 else None,
+                connections=TEST_CONNECTIONS,
+            )
+
+            progress_bar.close()
+            io_object.seek(0)
+
+            match = md5(io_object.getvalue()).hexdigest() == md5_hash
+
+            print(
+                f"{filename!r} {'matches' if match else 'does not match'} {md5_hash!r}"
+            )
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(__main__())
